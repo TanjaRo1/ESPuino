@@ -80,19 +80,20 @@ void AudioPlayer_Init(void) {
 	uint8_t playListSortModeValue = gPrefsSettings.getUChar("PLSortMode", EnumUtils::underlying_value(AudioPlayer_PlaylistSortMode));
 	AudioPlayer_PlaylistSortMode = EnumUtils::to_enum<playlistSortMode>(playListSortModeValue);
 
-#ifndef USE_LAST_VOLUME_AFTER_REBOOT
-	// Get initial volume from NVS
-	uint32_t nvsInitialVolume = gPrefsSettings.getUInt("initVolume", 0);
-#else
-	// Get volume used at last shutdown
-	uint32_t nvsInitialVolume = gPrefsSettings.getUInt("previousVolume", 999);
-	if (nvsInitialVolume == 999) {
-		gPrefsSettings.putUInt("previousVolume", AudioPlayer_GetInitVolume());
-		nvsInitialVolume = AudioPlayer_GetInitVolume();
+	uint32_t nvsInitialVolume;
+	if (!gPrefsSettings.getBool("recoverVolBoot", false)) {
+		// Get initial volume from NVS
+		nvsInitialVolume = gPrefsSettings.getUInt("initVolume", 0);
 	} else {
-		Log_Println(rememberLastVolume, LOGLEVEL_ERROR);
+		// Get volume used at last shutdown
+		nvsInitialVolume = gPrefsSettings.getUInt("previousVolume", 999);
+		if (nvsInitialVolume == 999) {
+			gPrefsSettings.putUInt("previousVolume", AudioPlayer_GetInitVolume());
+			nvsInitialVolume = AudioPlayer_GetInitVolume();
+		} else {
+			Log_Println(rememberLastVolume, LOGLEVEL_ERROR);
+		}
 	}
-#endif
 
 	if (nvsInitialVolume) {
 		AudioPlayer_SetInitVolume(nvsInitialVolume);
@@ -109,7 +110,8 @@ void AudioPlayer_Init(void) {
 		AudioPlayer_SetMaxVolume(nvsMaxVolumeSpeaker);
 		Log_Printf(LOGLEVEL_INFO, restoredMaxLoudnessForSpeakerFromNvs, nvsMaxVolumeSpeaker);
 	} else {
-		gPrefsSettings.putUInt("maxVolumeSp", nvsMaxVolumeSpeaker);
+		// Set max volume to max per default. Can be adjusted later via webinterface.
+		gPrefsSettings.putUInt("maxVolumeSp", 21);
 		Log_Println(wroteMaxLoudnessForSpeakerToNvs, LOGLEVEL_ERROR);
 	}
 
@@ -125,7 +127,8 @@ void AudioPlayer_Init(void) {
 		AudioPlayer_MaxVolumeHeadphone = nvsAudioPlayer_MaxVolumeHeadphone;
 		Log_Printf(LOGLEVEL_INFO, restoredMaxLoudnessForHeadphoneFromNvs, nvsAudioPlayer_MaxVolumeHeadphone);
 	} else {
-		gPrefsSettings.putUInt("maxVolumeHp", nvsAudioPlayer_MaxVolumeHeadphone);
+		// Set max volume to max per default. Can be adjusted later via webinterface.
+		gPrefsSettings.putUInt("maxVolumeHp", 21);
 		Log_Println(wroteMaxLoudnessForHeadphoneToNvs, LOGLEVEL_ERROR);
 	}
 #endif
@@ -141,6 +144,23 @@ void AudioPlayer_Init(void) {
 	gPlayProperties.coverFilePos = 0;
 	AudioPlayer_StationLogoUrl = "";
 	gPlayProperties.playlist = new Playlist();
+	gPlayProperties.SavePlayPosRfidChange = gPrefsSettings.getBool("savePosRfidChge", false); // SAVE_PLAYPOS_WHEN_RFID_CHANGE
+	gPlayProperties.pauseOnMinVolume = gPrefsSettings.getBool("pauseOnMinVol", false); // PAUSE_ON_MIN_VOLUME
+#ifdef PAUSE_WHEN_RFID_REMOVED
+	gPlayProperties.pauseIfRfidRemoved = gPrefsSettings.getBool("pauseRfidRem", true);
+#else
+	gPlayProperties.pauseIfRfidRemoved = gPrefsSettings.getBool("pauseRfidRem", false);
+#endif
+#ifdef DONT_ACCEPT_SAME_RFID_TWICE
+	gPlayProperties.dontAcceptRfidTwice = gPrefsSettings.getBool("dAccRfidTwice", true);
+#else
+	gPlayProperties.dontAcceptRfidTwice = gPrefsSettings.getBool("dAccRfidTwice", false);
+#endif
+	if (gPlayProperties.pauseIfRfidRemoved) {
+		// ignore feature silently if PAUSE_WHEN_RFID_REMOVED is active
+		Log_Println("pauseIfRfidRemoved is enabled -> deactivate dontAcceptRfidTwice", LOGLEVEL_NOTICE);
+		gPlayProperties.dontAcceptRfidTwice = false;
+	}
 
 	// Don't start audio-task in BT-speaker mode!
 	if ((System_GetOperationMode() == OPMODE_NORMAL) || (System_GetOperationMode() == OPMODE_BLUETOOTH_SOURCE)) {
@@ -161,15 +181,13 @@ void AudioPlayer_Exit(void) {
 	// save playtime total to NVS
 	playTimeSecTotal += playTimeSecSinceStart;
 	gPrefsSettings.putULong("playTimeTotal", playTimeSecTotal);
-// Make sure last playposition for audiobook is saved when playback is active while shutdown was initiated
-#ifdef SAVE_PLAYPOS_BEFORE_SHUTDOWN
-	if (!gPlayProperties.pausePlay && (gPlayProperties.playMode == AUDIOBOOK || gPlayProperties.playMode == AUDIOBOOK_LOOP)) {
+	// Make sure last playposition for audiobook is saved when playback is active while shutdown was initiated
+	if (gPrefsSettings.getBool("savePosShutdown", false) && !gPlayProperties.pausePlay && (gPlayProperties.playMode == AUDIOBOOK || gPlayProperties.playMode == AUDIOBOOK_LOOP)) {
 		AudioPlayer_TrackControlToQueueSender(PAUSEPLAY);
 		while (!gPlayProperties.pausePlay) { // Make sure to wait until playback is paused in order to be sure that playposition saved in NVS
 			vTaskDelay(portTICK_PERIOD_MS * 100u);
 		}
 	}
-#endif
 }
 
 static uint32_t lastPlayingTimestamp = 0;
@@ -283,13 +301,8 @@ void Audio_setTitle(const char *format, ...) {
 // Set maxVolume depending on headphone-adjustment is enabled and headphone is/is not connected
 // Enable/disable PA/HP-amps initially
 void AudioPlayer_SetupVolumeAndAmps(void) {
-#ifdef PLAY_MONO_SPEAKER
-	gPlayProperties.currentPlayMono = true;
-	gPlayProperties.newPlayMono = true;
-#else
-	gPlayProperties.currentPlayMono = false;
-	gPlayProperties.newPlayMono = false;
-#endif
+	gPlayProperties.currentPlayMono = gPrefsSettings.getBool("playMono", false);
+	gPlayProperties.newPlayMono = gPrefsSettings.getBool("playMono", false);
 
 #ifndef HEADPHONE_ADJUST_ENABLE
 	AudioPlayer_MaxVolume = AudioPlayer_MaxVolumeSpeaker;
@@ -332,11 +345,7 @@ void AudioPlayer_HeadphoneVolumeManager(void) {
 	if (AudioPlayer_HeadphoneLastDetectionState != currentHeadPhoneDetectionState && (millis() - AudioPlayer_HeadphoneLastDetectionTimestamp >= headphoneLastDetectionDebounce)) {
 		if (currentHeadPhoneDetectionState) {
 			AudioPlayer_MaxVolume = AudioPlayer_MaxVolumeSpeaker;
-	#ifdef PLAY_MONO_SPEAKER
-			gPlayProperties.newPlayMono = true;
-	#else
-			gPlayProperties.newPlayMono = false;
-	#endif
+			gPlayProperties.newPlayMono = gPrefsSettings.getBool("playMono", false);
 
 	#ifdef GPIO_PA_EN
 			Port_Write(GPIO_PA_EN, true, false);
@@ -391,7 +400,7 @@ void AudioPlayer_Task(void *parameter) {
 	AudioPlayer_CurrentVolume = AudioPlayer_GetInitVolume();
 	audio->setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
 	audio->setVolumeSteps(AUDIOPLAYER_VOLUME_MAX);
-	audio->setVolume(AudioPlayer_CurrentVolume, VOLUMECURVE);
+	audio->setVolume(AudioPlayer_CurrentVolume, gPrefsSettings.getUChar("volumeCurve", 0));
 	audio->forceMono(gPlayProperties.currentPlayMono);
 	int8_t currentEqualizer[3] = {gPrefsSettings.getChar("gainLowPass", 0), gPrefsSettings.getChar("gainBandPass", 0), gPrefsSettings.getChar("gainHighPass", 0)};
 	audio->setTone(currentEqualizer[0], currentEqualizer[1], currentEqualizer[2]);
@@ -412,10 +421,10 @@ void AudioPlayer_Task(void *parameter) {
 		*/
 		if (xQueueReceive(gVolumeQueue, &currentVolume, 0) == pdPASS) {
 			Log_Printf(LOGLEVEL_INFO, newLoudnessReceivedQueue, currentVolume);
-			audio->setVolume(currentVolume, VOLUMECURVE);
+			audio->setVolume(currentVolume, gPrefsSettings.getUChar("volumeCurve", 0));
 			Web_SendWebsocketData(0, WebsocketCodeType::Volume);
 #ifdef MQTT_ENABLE
-			publishMqtt(topicLoudnessState, currentVolume, false);
+			publishMqtt(topicLoudnessState, static_cast<uint32_t>(currentVolume), false);
 #endif
 		}
 
@@ -469,8 +478,8 @@ void AudioPlayer_Task(void *parameter) {
 				gPlayProperties.trackFinished = false;
 				gPlayProperties.playlistFinished = false;
 #ifdef MQTT_ENABLE
-				publishMqtt(topicPlaymodeState, gPlayProperties.playMode, false);
-				publishMqtt(topicRepeatModeState, AudioPlayer_GetRepeatMode(), false);
+				publishMqtt(topicPlaymodeState, static_cast<uint32_t>(gPlayProperties.playMode), false);
+				publishMqtt(topicRepeatModeState, static_cast<uint32_t>(AudioPlayer_GetRepeatMode()), false);
 #endif
 
 				// If we're in audiobook-mode and apply a modification-card, we don't
@@ -552,7 +561,7 @@ void AudioPlayer_Task(void *parameter) {
 					if (gPlayProperties.repeatCurrentTrack) { // End loop if button was pressed
 						gPlayProperties.repeatCurrentTrack = false;
 #ifdef MQTT_ENABLE
-						publishMqtt(topicRepeatModeState, AudioPlayer_GetRepeatMode(), false);
+						publishMqtt(topicRepeatModeState, static_cast<uint32_t>(AudioPlayer_GetRepeatMode()), false);
 #endif
 					}
 					// Allow next track if current track played in playlist isn't the last track.
@@ -587,7 +596,7 @@ void AudioPlayer_Task(void *parameter) {
 					if (gPlayProperties.repeatCurrentTrack) { // End loop if button was pressed
 						gPlayProperties.repeatCurrentTrack = false;
 #ifdef MQTT_ENABLE
-						publishMqtt(topicRepeatModeState, AudioPlayer_GetRepeatMode(), false);
+						publishMqtt(topicRepeatModeState, static_cast<uint32_t>(AudioPlayer_GetRepeatMode()), false);
 #endif
 					}
 					if (gPlayProperties.playMode == WEBSTREAM) {
@@ -711,7 +720,7 @@ void AudioPlayer_Task(void *parameter) {
 					Audio_setTitle(noPlaylist);
 					AudioPlayer_ClearCover();
 #ifdef MQTT_ENABLE
-					publishMqtt(topicPlaymodeState, gPlayProperties.playMode, false);
+					publishMqtt(topicPlaymodeState, static_cast<uint32_t>(gPlayProperties.playMode), false);
 #endif
 					gPlayProperties.currentTrackNumber = 0;
 					if (gPlayProperties.sleepAfterPlaylist) {
@@ -906,24 +915,19 @@ void AudioPlayer_Task(void *parameter) {
 			// we are idle, update timeout so that we do not get a spurious error when launching into a playlist
 			playbackTimeoutStart = millis();
 		}
-		if ((System_GetOperationMode() == OPMODE_BLUETOOTH_SOURCE) && audio->isRunning()) {
-			// do not delay here, audio task is time critical in BT-Source mode
-		} else {
-			vTaskDelay(portTICK_PERIOD_MS * 1);
-		}
-		// esp_task_wdt_reset(); // Don't forget to feed the dog!
+		vTaskDelay(portTICK_PERIOD_MS * 1);
 
-#ifdef DONT_ACCEPT_SAME_RFID_TWICE_ENABLE
-		static uint8_t resetOnNextIdle = false;
-		if (gPlayProperties.playlistFinished || gPlayProperties.playMode == NO_PLAYLIST) {
-			if (resetOnNextIdle) {
-				Rfid_ResetOldRfid();
-				resetOnNextIdle = false;
+		if (gPlayProperties.dontAcceptRfidTwice) {
+			static uint8_t resetOnNextIdle = false;
+			if (gPlayProperties.playlistFinished || gPlayProperties.playMode == NO_PLAYLIST) {
+				if (resetOnNextIdle) {
+					Rfid_ResetOldRfid();
+					resetOnNextIdle = false;
+				}
+			} else {
+				resetOnNextIdle = true;
 			}
-		} else {
-			resetOnNextIdle = true;
 		}
-#endif
 	}
 	vTaskDelete(NULL);
 }
@@ -973,36 +977,34 @@ void AudioPlayer_EqualizerToQueueSender(const int8_t gainLowPass, const int8_t g
 
 // Pauses playback if playback is active and volume is changes from minVolume+1 to minVolume (usually 0)
 void AudioPlayer_PauseOnMinVolume(const uint8_t oldVolume, const uint8_t newVolume) {
-#ifdef PAUSE_ON_MIN_VOLUME
-	if (gPlayProperties.playMode == BUSY || gPlayProperties.playMode == NO_PLAYLIST) {
-		return;
-	}
+	if (gPlayProperties.pauseOnMinVolume) {
+		if (gPlayProperties.playMode == BUSY || gPlayProperties.playMode == NO_PLAYLIST) {
+			return;
+		}
 
-	if (!gPlayProperties.pausePlay) { // Volume changes from 1 to 0
-		if (oldVolume == AudioPlayer_GetMinVolume() + 1 && newVolume == AudioPlayer_GetMinVolume()) {
-			Cmd_Action(CMD_PLAYPAUSE);
+		if (!gPlayProperties.pausePlay) { // Volume changes from 1 to 0
+			if (oldVolume == AudioPlayer_GetMinVolume() + 1 && newVolume == AudioPlayer_GetMinVolume()) {
+				Cmd_Action(CMD_PLAYPAUSE);
+			}
+		}
+		if (gPlayProperties.pausePlay) { // Volume changes from 0 to 1
+			if (oldVolume == AudioPlayer_GetMinVolume() && newVolume > AudioPlayer_GetMinVolume()) {
+				Cmd_Action(CMD_PLAYPAUSE);
+			}
 		}
 	}
-	if (gPlayProperties.pausePlay) { // Volume changes from 0 to 1
-		if (oldVolume == AudioPlayer_GetMinVolume() && newVolume > AudioPlayer_GetMinVolume()) {
-			Cmd_Action(CMD_PLAYPAUSE);
-		}
-	}
-#endif
 }
 
 // Receives de-serialized RFID-data (from NVS) and dispatches playlists for the given
 // playmode to the track-queue.
 void AudioPlayer_TrackQueueDispatcher(const char *_itemToPlay, const uint32_t _lastPlayPos, const uint32_t _playMode, const uint16_t _trackLastPlayed) {
-// Make sure last playposition for audiobook is saved when new RFID-tag is applied
-#ifdef SAVE_PLAYPOS_WHEN_RFID_CHANGE
-	if (!gPlayProperties.pausePlay && (gPlayProperties.playMode == AUDIOBOOK || gPlayProperties.playMode == AUDIOBOOK_LOOP)) {
+	// Make sure last playposition for audiobook is saved when new RFID-tag is applied
+	if (gPlayProperties.SavePlayPosRfidChange && !gPlayProperties.pausePlay && (gPlayProperties.playMode == AUDIOBOOK || gPlayProperties.playMode == AUDIOBOOK_LOOP)) {
 		AudioPlayer_TrackControlToQueueSender(PAUSEPLAY);
 		while (!gPlayProperties.pausePlay) { // Make sure to wait until playback is paused in order to be sure that playposition saved in NVS
 			vTaskDelay(portTICK_PERIOD_MS * 100u);
 		}
 	}
-#endif
 
 	gPlayProperties.startAtFilePos = _lastPlayPos;
 	gPlayProperties.currentTrackNumber = _trackLastPlayed;
@@ -1060,10 +1062,8 @@ void AudioPlayer_TrackQueueDispatcher(const char *_itemToPlay, const uint32_t _l
 	gPlayProperties.saveLastPlayPosition = false;
 	gPlayProperties.playUntilTrackNumber = 0;
 
-#ifdef PLAY_LAST_RFID_AFTER_REBOOT
 	// Store last RFID-tag to NVS
 	gPrefsSettings.putString("lastRfid", gCurrentRfidTagId);
-#endif
 
 	bool error = false;
 	switch (_playMode) {
@@ -1454,19 +1454,8 @@ void audio_eof_speech(const char *info) {
 	gPlayProperties.currentSpeechActive = false;
 }
 
+// bitsPerSample always 16
+// channels always 2
 void audio_process_i2s(int16_t *outBuff, uint16_t validSamples, uint8_t bitsPerSample, uint8_t channels, bool *continueI2S) {
-
-	uint32_t sample;
-	for (int i = 0; i < validSamples; i++) {
-		if (channels == 2) {
-			// stereo
-			sample = (uint16_t(outBuff[i * 2]) << 16) | uint16_t(outBuff[i * 2 + 1]);
-			*continueI2S = !Bluetooth_Source_SendAudioData(&sample);
-		}
-		if (channels == 1) {
-			// mono
-			sample = (uint16_t(outBuff[i]) << 16) | uint16_t(outBuff[i]);
-			*continueI2S = !Bluetooth_Source_SendAudioData(&sample);
-		}
-	}
+	*continueI2S = !Bluetooth_Source_SendAudioData(outBuff, validSamples);
 }
